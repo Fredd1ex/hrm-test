@@ -74,6 +74,8 @@ class PretrainConfig(pydantic.BaseModel):
     seed: int = 0
     checkpoint_every_eval: bool = False
     checkpoint_every_steps: Optional[int] = None
+    log_every_steps: int = 10
+    log_to_wandb: bool = True
     eval_interval: Optional[int] = None
     eval_save_outputs: List[str] = []
 
@@ -203,13 +205,15 @@ def save_train_state(config: PretrainConfig, train_state: TrainState):
 
     os.makedirs(config.checkpoint_path, exist_ok=True)
     torch.save(train_state.model.state_dict(), os.path.join(config.checkpoint_path, f"step_{train_state.step}"))
+    training_state_path = os.path.join(config.checkpoint_path, f"training_state_step_{train_state.step}.pt")
     torch.save({
         "model": train_state.model.state_dict(),
         "optimizers": [optimizer.state_dict() for optimizer in train_state.optimizers],
         "step": train_state.step,
         "total_steps": train_state.total_steps,
         "completed_iters": train_state.completed_iters,
-    }, os.path.join(config.checkpoint_path, f"training_state_step_{train_state.step}.pt"))
+    }, training_state_path)
+    print(f"Saved resumable checkpoint: {training_state_path}")
 
 
 def load_train_state(config: PretrainConfig, train_state: TrainState):
@@ -372,7 +376,7 @@ def evaluate(config: PretrainConfig, train_state: TrainState, eval_loader: torch
 
 
 def save_code_and_config(config: PretrainConfig):
-    if config.checkpoint_path is None or wandb.run is None:
+    if config.checkpoint_path is None:
         return
 
     os.makedirs(config.checkpoint_path, exist_ok=True)
@@ -394,7 +398,8 @@ def save_code_and_config(config: PretrainConfig):
         yaml.dump(config.model_dump(), f)
 
     # Log code
-    wandb.run.log_code(config.checkpoint_path)
+    if wandb.run is not None:
+        wandb.run.log_code(config.checkpoint_path)
 
 
 def load_synced_config(hydra_config: DictConfig, rank: int, world_size: int) -> PretrainConfig:
@@ -457,8 +462,9 @@ def launch(hydra_config: DictConfig):
     if RANK == 0:
         progress_bar = tqdm.tqdm(total=train_state.total_steps, initial=train_state.step)
 
-        wandb.init(project=config.project_name, name=config.run_name, config=config.model_dump(), settings=wandb.Settings(_disable_stats=True))  # type: ignore
-        wandb.log({"num_params": sum(x.numel() for x in train_state.model.parameters())}, step=0)
+        if config.log_to_wandb:
+            wandb.init(project=config.project_name, name=config.run_name, config=config.model_dump(), settings=wandb.Settings(_disable_stats=True))  # type: ignore
+            wandb.log({"num_params": sum(x.numel() for x in train_state.model.parameters())}, step=0)
         save_code_and_config(config)
 
     # Training Loop
@@ -471,8 +477,12 @@ def launch(hydra_config: DictConfig):
             metrics = train_batch(config, train_state, batch, global_batch_size, rank=RANK, world_size=WORLD_SIZE)
 
             if RANK == 0 and metrics is not None:
-                wandb.log(metrics, step=train_state.step)
+                if config.log_to_wandb:
+                    wandb.log(metrics, step=train_state.step)
                 progress_bar.update(train_state.step - progress_bar.n)  # type: ignore
+                if config.log_every_steps > 0 and train_state.step % config.log_every_steps == 0:
+                    metric_text = " ".join(f"{key}={float(value):.4f}" for key, value in metrics.items())
+                    print(f"Step {train_state.step}/{train_state.total_steps}: {metric_text}")
 
             if RANK == 0 and config.checkpoint_every_steps is not None and config.checkpoint_every_steps > 0 and train_state.step % config.checkpoint_every_steps == 0:
                 save_train_state(config, train_state)
@@ -481,7 +491,7 @@ def launch(hydra_config: DictConfig):
         train_state.model.eval()
         metrics = evaluate(config, train_state, eval_loader, eval_metadata, rank=RANK, world_size=WORLD_SIZE)
 
-        if RANK == 0 and metrics is not None:
+        if RANK == 0 and metrics is not None and config.log_to_wandb:
             wandb.log(metrics, step=train_state.step)
             
         ############ Checkpointing
@@ -492,7 +502,8 @@ def launch(hydra_config: DictConfig):
     # finalize
     if dist.is_initialized():
         dist.destroy_process_group()
-    wandb.finish()
+    if config.log_to_wandb:
+        wandb.finish()
 
 
 if __name__ == "__main__":

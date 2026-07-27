@@ -12,6 +12,8 @@ epochs: 10
 eval_interval: 1
 checkpoint_every_eval: True
 checkpoint_every_steps: 250
+log_every_steps: 10
+log_to_wandb: False
 
 lr: 1e-4
 lr_min_ratio: 0.1
