@@ -68,10 +68,12 @@ class PretrainConfig(pydantic.BaseModel):
     project_name: Optional[str] = None
     run_name: Optional[str] = None
     checkpoint_path: Optional[str] = None
+    resume_checkpoint: Optional[str] = None
 
     # Extras
     seed: int = 0
     checkpoint_every_eval: bool = False
+    checkpoint_every_steps: Optional[int] = None
     eval_interval: Optional[int] = None
     eval_save_outputs: List[str] = []
 
@@ -85,6 +87,7 @@ class TrainState:
 
     step: int
     total_steps: int
+    completed_iters: int
 
 
 def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size: int, **kwargs):
@@ -189,17 +192,49 @@ def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetada
         model=model,
         optimizers=optimizers,
         optimizer_lrs=optimizer_lrs,
-        carry=None
+        carry=None,
+        completed_iters=0,
     )
 
 
 def save_train_state(config: PretrainConfig, train_state: TrainState):
-    # FIXME: Only saved model.
     if config.checkpoint_path is None:
         return
 
     os.makedirs(config.checkpoint_path, exist_ok=True)
     torch.save(train_state.model.state_dict(), os.path.join(config.checkpoint_path, f"step_{train_state.step}"))
+    torch.save({
+        "model": train_state.model.state_dict(),
+        "optimizers": [optimizer.state_dict() for optimizer in train_state.optimizers],
+        "step": train_state.step,
+        "total_steps": train_state.total_steps,
+        "completed_iters": train_state.completed_iters,
+    }, os.path.join(config.checkpoint_path, f"training_state_step_{train_state.step}.pt"))
+
+
+def load_train_state(config: PretrainConfig, train_state: TrainState):
+    if config.resume_checkpoint is None:
+        return
+
+    checkpoint = torch.load(config.resume_checkpoint, map_location="cuda")
+    if not isinstance(checkpoint, dict) or "model" not in checkpoint:
+        raise ValueError("resume_checkpoint must be a training_state_step_<N>.pt checkpoint.")
+
+    try:
+        train_state.model.load_state_dict(checkpoint["model"])
+    except RuntimeError:
+        # Checkpoints can have a torch.compile prefix depending on the run.
+        train_state.model.load_state_dict({k.removeprefix("_orig_mod."): v for k, v in checkpoint["model"].items()})
+
+    optimizer_states = checkpoint.get("optimizers", [])
+    if len(optimizer_states) != len(train_state.optimizers):
+        raise ValueError("Checkpoint optimizer count does not match the current training configuration.")
+    for optimizer, optimizer_state in zip(train_state.optimizers, optimizer_states):
+        optimizer.load_state_dict(optimizer_state)
+
+    train_state.step = int(checkpoint["step"])
+    train_state.completed_iters = int(checkpoint["completed_iters"])
+    train_state.carry = None
 
 
 def compute_lr(base_lr: float, config: PretrainConfig, train_state: TrainState):
@@ -415,18 +450,19 @@ def launch(hydra_config: DictConfig):
 
     # Train state
     train_state = init_train_state(config, train_metadata, world_size=WORLD_SIZE)
+    load_train_state(config, train_state)
 
     # Progress bar and logger
     progress_bar = None
     if RANK == 0:
-        progress_bar = tqdm.tqdm(total=train_state.total_steps)
+        progress_bar = tqdm.tqdm(total=train_state.total_steps, initial=train_state.step)
 
         wandb.init(project=config.project_name, name=config.run_name, config=config.model_dump(), settings=wandb.Settings(_disable_stats=True))  # type: ignore
         wandb.log({"num_params": sum(x.numel() for x in train_state.model.parameters())}, step=0)
         save_code_and_config(config)
 
     # Training Loop
-    for _iter_id in range(total_iters):
+    for _iter_id in range(train_state.completed_iters, total_iters):
         print (f"[Rank {RANK}, World Size {WORLD_SIZE}]: Epoch {_iter_id * train_epochs_per_iter}")
 
         ############ Train Iter
@@ -438,6 +474,9 @@ def launch(hydra_config: DictConfig):
                 wandb.log(metrics, step=train_state.step)
                 progress_bar.update(train_state.step - progress_bar.n)  # type: ignore
 
+            if RANK == 0 and config.checkpoint_every_steps is not None and config.checkpoint_every_steps > 0 and train_state.step % config.checkpoint_every_steps == 0:
+                save_train_state(config, train_state)
+
         ############ Evaluation
         train_state.model.eval()
         metrics = evaluate(config, train_state, eval_loader, eval_metadata, rank=RANK, world_size=WORLD_SIZE)
@@ -446,6 +485,7 @@ def launch(hydra_config: DictConfig):
             wandb.log(metrics, step=train_state.step)
             
         ############ Checkpointing
+        train_state.completed_iters = _iter_id + 1
         if RANK == 0 and (config.checkpoint_every_eval or (_iter_id == total_iters - 1)):
             save_train_state(config, train_state)
 
