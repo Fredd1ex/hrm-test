@@ -22,3 +22,4 @@ expansion: 4
 # optimizer.  Keep a single unused identifier to avoid changing that code.
 puzzle_emb_ndim: ${.hidden_size}
 pos_encodings: learned
+forward_dtype: float16

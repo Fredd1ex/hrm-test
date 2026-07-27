@@ -7,8 +7,12 @@ import torch.nn.functional as F
 try:
     from flash_attn_interface import flash_attn_func  # type: ignore[import]
 except ImportError:
-    # Fallback to FlashAttention 2
-    from flash_attn import flash_attn_func  # type: ignore[import]
+    try:
+        # Fallback to FlashAttention 2
+        from flash_attn import flash_attn_func  # type: ignore[import]
+    except ImportError:
+        # PyTorch 2 provides a portable CUDA implementation without extensions.
+        flash_attn_func = None
 
 from models.common import trunc_normal_init_
 
@@ -126,10 +130,19 @@ class Attention(nn.Module):
             cos, sin = cos_sin
             query, key = apply_rotary_pos_emb(query, key, cos, sin)
 
-        # flash attn
-        attn_output = flash_attn_func(q=query, k=key, v=value, causal=self.causal)
-        if isinstance(attn_output, tuple):  # fa2 and fa3 compatibility
-            attn_output = attn_output[0]
+        if flash_attn_func is not None:
+            attn_output = flash_attn_func(q=query, k=key, v=value, causal=self.causal)
+            if isinstance(attn_output, tuple):  # fa2 and fa3 compatibility
+                attn_output = attn_output[0]
+        else:
+            # scaled_dot_product_attention expects B x heads x sequence x head_dim.
+            attn_output = F.scaled_dot_product_attention(
+                query.transpose(1, 2),
+                key.transpose(1, 2),
+                value.transpose(1, 2),
+                dropout_p=0.0,
+                is_causal=self.causal,
+            ).transpose(1, 2)
 
         attn_output = attn_output.view(batch_size, seq_len, self.output_size)  # type: ignore
         return self.o_proj(attn_output)
